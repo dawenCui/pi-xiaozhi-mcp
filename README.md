@@ -4,9 +4,9 @@
 
 - 🎤 跟小智设备说话（DeepSeek/Qwen 做主对话，~1 秒响应）
 - 🤖 需要 Pi 能力时，LLM 通过 WSS MCP 调你 Mac 上的 `pi --print`
-- 🎯 异步模式：长任务立刻回执，结果稍后取
+- 🎯 异步模式：长任务超时自动转后台，结果稍后取
 
-> "Pai，帮我查一下今天的天气" → DeepSeek 看到 `pi_quick` 工具 → WSS 调到你 Mac → spawn `pi --print` → 结果回 TTS 念出来
+> "Pai，帮我查一下今天的天气" → DeepSeek 看到 `pi_ask` 工具 → WSS 调到你 Mac → spawn `pi --print` → 结果回 TTS 念出来
 
 ---
 
@@ -16,11 +16,11 @@
 [虾哥云平台](https://xiaozhi.me) 提供 MCP 接入点（WSS），让自定义 MCP server 暴露给 LLM。
 
 本项目：
-- ✅ 通过 xiaozhi.me 的 WSS MCP 接入点给 LLM 加了 `pi_task` / `pi_quick` / `pi_background` 等工具
+- ✅ 通过 xiaozhi.me 的 WSS MCP 接入点给 LLM 加了 `pi_ask` / `pi_check_results` / `pi_status` / `pi_stop` 工具
 - ✅ 工具通过 WSS 路由到你 Mac 上的本地 bridge
 - ✅ 本地 bridge spawn `pi --print` 跑 Pi Agent
-- ✅ 异步模式：LLM 立刻回"Pai 正在处理"，结果写 outbox，用户问"结果呢"再取
-- ✅ 自动重连（指数退避 1s → 600s）
+- ✅ 异步模式：4 秒内出结果直接念，超时回"Pai 正在处理"，结果写队列，用户问"结果呢"再取
+- ✅ 自动重连（指数退避 1s → 600s，连接成功后复位）
 
 架构：
 
@@ -30,22 +30,23 @@
         小智设备麦克风 ── 流式 ASR
                 ↓
         虾哥后端 api.xiaozhi.me + DeepSeek V4
-                ↓ 看到 pi_task 工具就 tools/call
+                ↓ 看到 pi_ask 工具就 tools/call
         wss://api.xiaozhi.me/mcp/?token=...
                 ↓
         你 Mac 上的 mcp_bridge.py（WSS ↔ stdio）
                 ↓
-        server.py (FastMCP, 5 个工具)
+        server.py (MCPServer, 4 个工具)
                 ↓ subprocess
         pi --print "task"
                 ↓
-        立刻返回 "Pai 正在处理，稍等一下问我"
+        4 秒内完成 → 直接返回结果
+        超时 → 返回 "Pai 正在处理…，稍后问我结果"
                 ↓
         TTS → 小智说话
         ......稍后......
 你说「Pai，结果呢」
                 ↓
-        pi_check_results 取最新结果
+        pi_check_results 取下一个后台结果
                 ↓
         TTS 念结果（自动截到 600 字）
 ```
@@ -129,10 +130,10 @@ tail -f /tmp/pi-xiaozhi-bridge.log
 
 | 你说 | 效果 |
 |---|---|
-| Pai，1+1 等于几 | `pi_quick` 同步执行，直接念结果 |
-| Pai，帮我查一下今天的天气 | `pi_task` 异步，"Pai 正在查" |
-| Pai，结果呢 | `pi_check_results` 取最新结果念出来 |
-| Pai，写一篇 500 字关于 AI 的文章 | `pi_background`，"Pai 这就去写" |
+| Pai，1+1 等于几 | `pi_ask` 同步出结果，直接念结果 |
+| Pai，帮我查一下今天的天气 | `pi_ask` 执行，超时自动转后台 |
+| Pai，结果呢 | `pi_check_results` 取下一个后台结果念出来 |
+| Pai，写一篇 500 字关于 AI 的文章 | `pi_ask`，超时回“正在处理”，写完再问结果 |
 | Pai 在吗 | `pi_status` 检查 Pi 是否可用 |
 
 ---
@@ -145,12 +146,11 @@ xiaozhi.me 控制台 → 智能体配置 → 角色介绍里贴这段：
 我叫Pai，桌面陪伴AI，活泼可爱、口语自然、回复1-2句话不超过50字。
 能力：
 - 简单问答、闲聊、查时间天气：直接回答
-- 需要执行任务、查资料、写代码、分析文件：调 pi_task 工具异步执行
-- 简单快速查询（一两句话能回答的）：调 pi_quick
-- 写文章、深度研究等长任务：调 pi_background，立刻口语回复
-- 用户问"结果呢""查到了吗""写完了吗"：调 pi_check_results
-- 用户问"Pai在吗""Pai状态"：调 pi_status
-不要 markdown / 列表 / emoji（要朗读出来）。
+- 需要执行任务、查资料、写代码、分析文件、写文章：调 pi_ask 工具执行
+- 用户问“结果呢”“查到了吗”“写完了吗”：调 pi_check_results
+- 用户问“Pai在吗”“Pai状态”：调 pi_status
+- 任务卡住或用户要求中止：调 pi_stop
+回复必须是纯口语文字，禁止 markdown、列表、emoji，因为内容会被语音朗读，格式符号会干扰听感。
 ```
 
 ---
@@ -159,11 +159,10 @@ xiaozhi.me 控制台 → 智能体配置 → 角色介绍里贴这段：
 
 | 工具 | 模式 | 超时 | 场景 |
 |---|---|---|---|
-| `pi_task` | 异步 | 5 分钟 | 通用任务，立刻回执 |
-| `pi_quick` | 同步 | 30 秒 | 快速查询，直接返回结果 |
-| `pi_background` | 异步 | 5 分钟 | 长任务，自定义口语回执 |
-| `pi_check_results` | 同步 | - | 取最新异步任务结果 |
-| `pi_status` | 同步 | 5 秒 | 检查 Pi 是否可用 |
+| `pi_ask` | 同步优先 | 4 秒（可配） | 统一入口，4 秒内出结果直接念；超时回“正在处理”，后台继续 |
+| `pi_check_results` | 同步 | - | FIFO 取下一个后台完成结果（取完即消） |
+| `pi_status` | 同步 | 5 秒 | 检查 Pi 是否可用、队列状态 |
+| `pi_stop` | 同步 | - | 终止当前任务并释放锁 |
 
 ---
 
@@ -174,7 +173,8 @@ xiaozhi.me 控制台 → 智能体配置 → 角色介绍里贴这段：
 | `MCP_ENDPOINT` | 是 | 从 xiaozhi.me 获取的 WSS URL |
 | `PI_BIN` | 否 | pi 命令路径（默认 `pi`） |
 | `PI_WORKDIR` | 否 | pi 工作目录（默认 `~`） |
-| `PI_EXTRA_ARGS` | 否 | pi 额外参数（如 `--model xxx`） |
+| `PI_EXTRA_ARGS` | 否 | pi 额外参数（如 `--model xxx`，支持引号/空格） |
+| `PI_SYNC_TIMEOUT` | 否 | `pi_ask` 同步等待秒数，超时自动转后台（默认 `4`，需明显低于 10 秒以保住语音回复） |
 | `MCP_CONFIG` | 否 | mcp_config.json 路径（默认 `./mcp_config.json`） |
 
 ---
@@ -182,7 +182,7 @@ xiaozhi.me 控制台 → 智能体配置 → 角色介绍里贴这段：
 ## 限制
 
 - **小智设备只能绑一个智能体** —— 绑给"Pai"后，想换别的智能体需要在 xiaozhi.me 重新切换
-- **Pi 任务有延迟** —— 异步模式下用户感知约 3-5 秒（"Pai 正在处理"立刻出来）+ 实际执行时间
+- **Pi 任务有延迟** —— 4 秒内完成的任务直接念结果；更长任务在约 4 秒后回"正在处理"，之后再加实际执行时间
 - **Mac 必须开机** —— bridge 需要本机进程 spawn `pi` 命令
 - **不能主动通知** —— 小智设备和 WSS bridge 都不支持主动推送，只能用户问"结果呢"时取
 
