@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pi_xiaozhi": {
+      "command": "/PATH/TO/pi-xiaozhi-mcp/bridge/.venv/bin/python",
+      "args": ["/PATH/TO/pi-xiaozhi-mcp/bridge/server.py"]
+    }
+  }
+}
