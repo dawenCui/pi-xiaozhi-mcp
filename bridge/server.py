@@ -272,7 +272,8 @@ async def _run_pi_sync(
         # 此处取消了一次 communicate()，后台会再次调用 proc.communicate()；
         # 现代 asyncio 支持「cancel 后重新 communicate」，
         # 由 test_communicate_retry_after_timeout 锁定该行为。
-        logger.warning("pi timeout (>%ds), continuing in background", timeout)
+        # 同步等待超时是预期行为：进程转后台继续跑，用 INFO 而非 WARNING。
+        logger.info("pi timeout (>%ds), continuing in background", timeout)
         # 返回哨兵字符串 "__TIMEOUT__" + 还活着的进程，交给 pi_ask 转后台。
         return False, "__TIMEOUT__", proc
     except Exception as e:
